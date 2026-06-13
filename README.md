@@ -70,11 +70,18 @@ source venv/bin/activate
 
 ```bash
 # Run the agent
-python tdd_agent.py ${HOME}/github/recharts/src/animation/RechartsAnimation.ts ${HOME}/github/recharts/test/animation/RechartsAnimation.spec.ts
+python tdd_agent.py \
+  --project_home="${HOME}/github/recharts" \
+  --source_file='src/animation/RechartsAnimation.ts' \
+  --test_file='test/animation/RechartsAnimation.spec.ts'
 ```
 
 ### Optional Arguments
 You can specify a different Ollama model using the `--model` flag:
 ```bash
-python tdd_agent.py MathOps.ts MathOps.test.ts --model codellama
+python tdd_agent.py \
+  --project_home="${HOME}/github/recharts" \
+  --source_file='src/animation/RechartsAnimation.ts' \
+  --test_file='test/animation/RechartsAnimation.spec.ts' \
+  --model='codellama:7b'
 ```

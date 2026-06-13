@@ -12,14 +12,14 @@ def extract_code(text):
         return match.group(1).strip()
     return text.strip()
 
-def run_tests(test_file):
+def run_tests(current_working_dir, test_file):
     """Runs tests on the specified test file, streaming output. Returns True if tests FAILED."""
     # We pass CI=true to prevent test runners like vitest or jest from entering watch mode and hanging
     env = dict(os.environ)
     env["CI"] = "true"
     
     process = subprocess.Popen(
-        ["npm", "test", test_file],
+        ["npm", "test", test_file, '--prefix', current_working_dir],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -90,12 +90,13 @@ def get_prompt(source_code, test_code):
 
 def main():
     parser = argparse.ArgumentParser(description="TDD Pair Programmer Local Agent")
-    parser.add_argument("source_file", help="Path to the source code file")
-    parser.add_argument("test_file", help="Path to the test code file")
+    parser.add_argument("--source_file", help="Path to the source code file")
+    parser.add_argument("--test_file", help="Path to the test code file")
+    parser.add_argument("--project_home", help="Path to the project home directory (where package.json is located)")
     parser.add_argument("--model", default="qwen2.5:7b", help="Local Ollama model to use (default: qwen2.5:7b)")
     args = parser.parse_args()
     # Basic validation of input files - allow for relative paths
-    current_working_dir = os.getcwd()
+    current_working_dir = args.project_home if args.project_home else os.getcwd()
     source_file_path = os.path.join(current_working_dir, args.source_file)
     test_file_path = os.path.join(current_working_dir, args.test_file)
 
@@ -144,7 +145,7 @@ def main():
 
         # Run tests to check if it's actually red
         print("\nRunning tests...")
-        failed, output = run_tests(test_file_path)
+        failed, output = run_tests(current_working_dir, test_file_path)
 
         if failed:
             print("\n✅ Success! A new RED (failing) test is ready for you to implement.")
