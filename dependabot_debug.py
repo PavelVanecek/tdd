@@ -21,14 +21,17 @@ def get_job_logs(token, repo_name, job_id):
     """Fetches job logs from GitHub API."""
     url = f"https://api.github.com/repos/{repo_name}/actions/jobs/{job_id}/logs"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
-    res = requests.get(url, headers=headers, allow_redirects=True)
+    res = requests.get(url, headers=headers, allow_redirects=True, timeout=30)
     if res.status_code == 200:
         return res.text
     else:
         return ""
 
 def run_bash_script(script, cwd):
-    """Runs a bash script in a subprocess and returns (returncode, stdout)."""
+    """Runs a bash script in a subprocess and returns (returncode, stdout).
+
+    Times out after 5 minutes to prevent runaway processes.
+    """
     process = subprocess.Popen(
         ["bash", "-c", script],
         cwd=cwd,
@@ -36,8 +39,14 @@ def run_bash_script(script, cwd):
         stderr=subprocess.STDOUT,
         text=True,
     )
-    stdout, _ = process.communicate()
-    return process.returncode, stdout
+    try:
+        stdout, _ = process.communicate(timeout=300)
+        return process.returncode, stdout
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, _ = process.communicate()
+        return process.returncode, stdout + "\n\nScript timed out after 5 minutes."
+
 
 def summarize_logs(llm, logs):
     """Asks the LLM to summarize the build logs."""
@@ -49,7 +58,7 @@ def read_npm_scripts(project_home):
     """Reads the npm scripts from package.json."""
     package_json_path = os.path.join(project_home, "package.json")
     if not os.path.exists(package_json_path):
-        return ""
+        raise Exception(f"package.json not found in directory {project_home}")
     with open(package_json_path, 'r') as f:
         package_json = json.load(f)
         return json.dumps(package_json.get("scripts", {}), indent=2)
@@ -107,11 +116,12 @@ Do not include any interactive commands.
 
 def setup_worktree(project_home, branch_name):
     """Creates a new git worktree for the given branch."""
-    worktree_path = os.path.join(project_home, f"worktree-{branch_name}")
+    safe_branch_name = branch_name.replace("/", "-")
+    worktree_path = os.path.join(project_home, f"worktree-{safe_branch_name}")
     if os.path.exists(worktree_path):
         subprocess.run(["rm", "-rf", worktree_path])
         subprocess.run(["git", "worktree", "prune"], cwd=project_home)
-    
+
     res = subprocess.run(["git", "worktree", "add", worktree_path, branch_name], cwd=project_home, capture_output=True, text=True)
     if res.returncode != 0:
         raise Exception(f"Failed to create worktree: {res.stderr}")
@@ -145,17 +155,17 @@ def attempt_reproduction(llm, summary, developing_md, worktree_dir, npm_scripts)
         if not script:
             print("LLM did not provide a valid bash script.")
             continue
-        
+
         print("Running reproduction script:")
         print(script)
         retcode, stdout = run_bash_script(script, worktree_dir)
-        
+
         if retcode != 0:
             print("Failure reproduced locally!")
             return True, stdout, script
         else:
             print("Script exited with 0. The issue was NOT reproduced.")
-            
+
     return False, "", ""
 
 def attempt_fix(llm, summary, reproduction_script, reproduction_output, worktree_dir):
@@ -164,30 +174,33 @@ def attempt_fix(llm, summary, reproduction_script, reproduction_output, worktree
         print(f"\nAsking LLM for fix suggestions (Attempt {attempt}/3)...")
         response = generate_fix_suggestions(llm, summary, reproduction_output)
         fix_script = extract_bash(response)
-        
+
         if not fix_script:
             print("LLM did not provide a valid bash script.")
             continue
-        
+
         print("Applying fix script:")
         print(fix_script)
-        run_bash_script(fix_script, worktree_dir)
-        
+        fix_retcode, fix_output = run_bash_script(fix_script, worktree_dir)
+        if fix_retcode != 0:
+          print(f"Warning: Fix script exited with code {fix_retcode}")
+          print(fix_output)
+
         print("Running reproduction script again to verify fix...")
         retcode, stdout = run_bash_script(reproduction_script, worktree_dir)
-        
+
         if retcode == 0:
             print("✅ Success! The build is fixed.")
             return True
         else:
             print("❌ The build is still failing. Trying another suggestion...")
-            
+
     return False
 
 def process_pr(pr, token, args, llm, developing_md, npm_scripts):
     """Processes a single PR."""
     print(f"\nProcessing PR #{pr.number}: {pr.title}")
-    
+
     failed_cr = get_failed_check(pr)
     if not failed_cr:
         print("No relevant failed checks found.")
@@ -198,7 +211,7 @@ def process_pr(pr, token, args, llm, developing_md, npm_scripts):
     if not logs:
         print("Could not fetch logs for this check.")
         return
-    
+
     print("Summarizing build logs...")
     summary = summarize_logs(llm, logs)
     print("--- SUMMARY ---")
@@ -222,17 +235,17 @@ def process_pr(pr, token, args, llm, developing_md, npm_scripts):
         subprocess.run(["npm", "run", "build"], cwd=worktree_dir, capture_output=True)
 
         reproduced, reproduction_output, reproduction_script = attempt_reproduction(llm, summary, developing_md, worktree_dir, npm_scripts)
-        
+
         if not reproduced:
             print("Could not reproduce the issue locally after 3 attempts.")
             return
 
         fixed = attempt_fix(llm, summary, reproduction_script, reproduction_output, worktree_dir)
-        
+
         if not fixed:
             print("Could not fix the build after 3 suggestions.")
             return
-            
+
     finally:
         print(f"Cleaning up worktree {worktree_dir}...")
         subprocess.run(["rm", "-rf", worktree_dir])
@@ -257,7 +270,7 @@ def main():
     g = Github(auth=auth)
     repo = g.get_repo(args.repo)
     print(f"Fetching open PRs for {args.repo}...")
-    
+
     dependabot_prs = get_dependabot_prs(repo)
     if not dependabot_prs:
         print("No open dependabot PRs found.")
