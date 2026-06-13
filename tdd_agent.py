@@ -84,6 +84,9 @@ def get_prompt(source_code, test_code):
     
     Your task is to write exactly ONE new unit test function that tests a new feature, edge case, or logical next step.
     The test is expected to fail with the current source code (the RED phase of TDD).
+    How to decide what test to write:
+    - Observe the source code carefully; if it has code comments, or a JSDoc comment describing the intended behavior, use that to identify untested behavior.
+    - If there are existing tests, look at what they are testing and identify a logical next test that is not yet covered.
     Output ONLY the TypeScript/TSX code for the new test function (e.g., `it('should do something', () => {{ ... }});`).
     Do not include imports or existing code. Do not provide explanations or extra text.
     """
