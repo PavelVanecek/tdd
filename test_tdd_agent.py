@@ -66,7 +66,7 @@ def test_run_tests(mock_popen):
     mock_process.returncode = 1 # Failed
     mock_popen.return_value = mock_process
     
-    failed, output = run_tests("fake_test_file.ts")
+    failed, output = run_tests("cwd", "fake_test_file.ts")
     
     assert failed is True
     assert "Running tests..." in output
@@ -75,7 +75,7 @@ def test_run_tests(mock_popen):
     # Verify Popen was called correctly with CI=true env
     mock_popen.assert_called_once()
     called_args, called_kwargs = mock_popen.call_args
-    assert called_args[0] == ["npm", "test", "fake_test_file.ts"]
+    assert called_args[0] == ["npm", "test", "fake_test_file.ts", "--prefix", "cwd"]
     assert called_kwargs["env"]["CI"] == "true"
 
 @patch("tdd_agent.subprocess.Popen")
@@ -85,7 +85,7 @@ def test_run_tests_passing(mock_popen):
     mock_process.returncode = 0 # Success
     mock_popen.return_value = mock_process
     
-    failed, output = run_tests("fake_test_file.ts")
+    failed, output = run_tests("cwd", "fake_test_file.ts")
     
     assert failed is False
     assert "All tests passed" in output
