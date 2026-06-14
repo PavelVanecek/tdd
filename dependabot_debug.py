@@ -7,6 +7,7 @@ import subprocess
 import github.Auth
 import requests
 import re
+import sqlite3
 from github import Github
 from langchain_ollama import OllamaLLM
 
@@ -171,6 +172,10 @@ def attempt_reproduction(llm, summary, developing_md, worktree_dir, npm_scripts)
 def attempt_fix(llm, summary, reproduction_script, reproduction_output, worktree_dir):
     """Attempts to fix the build locally."""
     for attempt in range(1, 4):
+        # Reset the worktree before attempting a new fix suggestion to avoid stacking broken changes
+        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=worktree_dir, capture_output=True)
+        subprocess.run(["git", "clean", "-fd"], cwd=worktree_dir, capture_output=True)
+
         print(f"\nAsking LLM for fix suggestions (Attempt {attempt}/3)...")
         response = generate_fix_suggestions(llm, summary, reproduction_output)
         fix_script = extract_bash(response)
@@ -191,71 +196,163 @@ def attempt_fix(llm, summary, reproduction_script, reproduction_output, worktree
 
         if retcode == 0:
             print("✅ Success! The build is fixed.")
-            return True
+            return True, fix_script
         else:
             print("❌ The build is still failing. Trying another suggestion...")
+            
+    return False, ""
 
-    return False
+def init_db(db_path):
+    """Initializes the SQLite database and creates the required tables."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pr_status (
+            pr_number INTEGER PRIMARY KEY,
+            commit_sha TEXT,
+            status TEXT,
+            check_id INTEGER,
+            logs TEXT,
+            summary TEXT,
+            reproduction_script TEXT,
+            reproduction_output TEXT,
+            fix_script TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    return conn
 
-def process_pr(pr, token, args, llm, developing_md, npm_scripts):
-    """Processes a single PR."""
+def get_pr_state(conn, pr_number):
+    """Fetches the processing state for a given PR."""
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM pr_status WHERE pr_number = ?", (pr_number,))
+    return cur.fetchone()
+
+def set_pr_state(conn, pr_number, commit_sha, status, **kwargs):
+    """Inserts or updates the processing state for a given PR."""
+    fields = ["commit_sha = ?", "status = ?", "updated_at = CURRENT_TIMESTAMP"]
+    values = [commit_sha, status]
+    for k, v in kwargs.items():
+        fields.append(f"{k} = ?")
+        values.append(v)
+    values.append(pr_number)
+
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM pr_status WHERE pr_number = ?", (pr_number,))
+    exists = cur.fetchone()
+
+    if exists:
+        query = f"UPDATE pr_status SET {', '.join(fields)} WHERE pr_number = ?"
+        cur.execute(query, values)
+    else:
+        cols = ["pr_number", "commit_sha", "status"] + list(kwargs.keys())
+        placeholders = ["?"] * len(cols)
+        vals = [pr_number, commit_sha, status] + list(kwargs.values())
+        query = f"INSERT INTO pr_status ({', '.join(cols)}) VALUES ({', '.join(placeholders)})"
+        cur.execute(query, vals)
+    conn.commit()
+
+def process_pr(pr, token, args, llm, developing_md, npm_scripts, conn):
+    """Processes a single PR, supporting resume logic based on DB state."""
     print(f"\nProcessing PR #{pr.number}: {pr.title}")
+    commit_sha = pr.get_commits().reversed[0].sha
 
-    failed_cr = get_failed_check(pr)
-    if not failed_cr:
-        print("No relevant failed checks found.")
-        return
+    state = get_pr_state(conn, pr.number)
+    if state:
+        if state['commit_sha'] != commit_sha:
+            print("PR has new commits since last run. Resetting state.")
+            set_pr_state(conn, pr.number, commit_sha, "pending")
+            state = get_pr_state(conn, pr.number)
+        elif state['status'] in ("fixed", "failed_reproduction", "failed_fix", "no_failed_checks"):
+            print(f"PR already processed (Status: {state['status']}). Skipping.")
+            return
+        else:
+            print(f"Resuming PR from state: {state['status']}")
+    else:
+        set_pr_state(conn, pr.number, commit_sha, "pending")
+        state = get_pr_state(conn, pr.number)
 
-    print(f"Found failed check: {failed_cr.name} (ID: {failed_cr.id})")
-    logs = get_job_logs(token, args.repo, failed_cr.id)
-    if not logs:
-        print("Could not fetch logs for this check.")
-        return
+    status = state['status']
 
-    print("Summarizing build logs...")
-    summary = summarize_logs(llm, logs)
-    print("--- SUMMARY ---")
-    print(summary)
-    print("---------------")
-
-    print("Setting up worktree...")
-    branch_name = pr.head.ref
-    try:
-        subprocess.run(["git", "fetch", "origin", f"pull/{pr.number}/head:{branch_name}"], cwd=args.project_home, capture_output=True)
-        worktree_dir = setup_worktree(args.project_home, branch_name)
-        # print the worktree directory
-        print("Set up a new worktree in ", worktree_dir, " with branch ", branch_name, " and commit ", pr.head.sha, "")
-    except Exception as e:
-        print(f"Error setting up worktree: {e}")
-        return
-
-    try:
-        print("Running npm install and npm run build in worktree...")
-        subprocess.run(["npm", "install"], cwd=worktree_dir, capture_output=True, check=True)
-        subprocess.run(["npm", "run", "build"], cwd=worktree_dir, capture_output=True)
-
-        reproduced, reproduction_output, reproduction_script = attempt_reproduction(llm, summary, developing_md, worktree_dir, npm_scripts)
-
-        if not reproduced:
-            print("Could not reproduce the issue locally after 3 attempts.")
+    if status == "pending":
+        failed_cr = get_failed_check(pr)
+        if not failed_cr:
+            print("No relevant failed checks found.")
+            set_pr_state(conn, pr.number, commit_sha, "no_failed_checks")
             return
 
-        fixed = attempt_fix(llm, summary, reproduction_script, reproduction_output, worktree_dir)
+        print(f"Found failed check: {failed_cr.name} (ID: {failed_cr.id})")
+        logs = get_job_logs(token, args.repo, failed_cr.id)
+        if not logs:
+            print("Could not fetch logs for this check.")
+            return
+        
+        print("Summarizing build logs...")
+        summary = summarize_logs(llm, logs)
+        print("--- SUMMARY ---")
+        print(summary)
+        print("---------------")
 
-        if not fixed:
-            print("Could not fix the build after 3 suggestions.")
+        set_pr_state(conn, pr.number, commit_sha, "summarized", check_id=failed_cr.id, logs=logs, summary=summary)
+        state = get_pr_state(conn, pr.number)
+        status = state['status']
+
+    if status in ("summarized", "reproduced"):
+        print("Setting up worktree...")
+        branch_name = pr.head.ref
+        try:
+            subprocess.run(["git", "fetch", "origin", f"pull/{pr.number}/head:{branch_name}"], cwd=args.project_home, capture_output=True)
+            worktree_dir = setup_worktree(args.project_home, branch_name)
+            print("Set up a new worktree in ", worktree_dir, " with branch ", branch_name, " and commit ", pr.head.sha,
+                  "")
+        except Exception as e:
+            print(f"Error setting up worktree: {e}")
             return
 
-    finally:
-        print(f"Cleaning up worktree {worktree_dir}...")
-        subprocess.run(["rm", "-rf", worktree_dir])
-        subprocess.run(["git", "worktree", "prune"], cwd=args.project_home)
+        try:
+            print("Running npm install and npm run build in worktree...")
+            subprocess.run(["npm", "install"], cwd=worktree_dir, capture_output=True, check=True)
+            subprocess.run(["npm", "run", "build"], cwd=worktree_dir, capture_output=True)
+
+            if status == "summarized":
+                summary = state['summary']
+                reproduced, reproduction_output, reproduction_script = attempt_reproduction(llm, summary, developing_md, worktree_dir, npm_scripts)
+                
+                if not reproduced:
+                    print("Could not reproduce the issue locally after 3 attempts.")
+                    set_pr_state(conn, pr.number, commit_sha, "failed_reproduction")
+                    return
+
+                set_pr_state(conn, pr.number, commit_sha, "reproduced", reproduction_script=reproduction_script, reproduction_output=reproduction_output)
+                state = get_pr_state(conn, pr.number)
+                status = state['status']
+
+            if status == "reproduced":
+                summary = state['summary']
+                reproduction_script = state['reproduction_script']
+                reproduction_output = state['reproduction_output']
+                
+                fixed, fix_script = attempt_fix(llm, summary, reproduction_script, reproduction_output, worktree_dir)
+                
+                if not fixed:
+                    print("Could not fix the build after 3 suggestions.")
+                    set_pr_state(conn, pr.number, commit_sha, "failed_fix")
+                    return
+                    
+                set_pr_state(conn, pr.number, commit_sha, "fixed", fix_script=fix_script)
+                
+        finally:
+            print(f"Cleaning up worktree {worktree_dir}...")
+            subprocess.run(["rm", "-rf", worktree_dir])
+            subprocess.run(["git", "worktree", "prune"], cwd=args.project_home)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Dependabot Build Failure Debugger")
     parser.add_argument("--project_home", required=True, help="Path to the root of the repository")
     parser.add_argument("--repo", default="recharts/recharts", help="GitHub repository name (e.g., recharts/recharts)")
     parser.add_argument("--model", default="qwen2.5:7b", help="Local Ollama model to use")
+    parser.add_argument("--db_path", default="dependabot_debug.db", help="Path to the SQLite database file")
     return parser.parse_args()
 
 def main():
@@ -266,7 +363,9 @@ def main():
         print("Error: GITHUB_TOKEN environment variable is not set.")
         sys.exit(1)
 
-    auth = github.Auth.Token(token);
+    conn = init_db(args.db_path)
+
+    auth = github.Auth.Token(token)
     g = Github(auth=auth)
     repo = g.get_repo(args.repo)
     print(f"Fetching open PRs for {args.repo}...")
@@ -285,7 +384,7 @@ def main():
     npm_scripts = read_npm_scripts(project_home)
 
     for pr in dependabot_prs:
-        process_pr(pr, token, args, llm, developing_md, npm_scripts)
+        process_pr(pr, token, args, llm, developing_md, npm_scripts, conn)
 
 
 def read_developing_md(project_home) -> str:
@@ -296,7 +395,6 @@ def read_developing_md(project_home) -> str:
         with open(developing_md_path, 'r') as f:
             developing_md = f.read()
     return developing_md
-
 
 if __name__ == "__main__":
     main()
