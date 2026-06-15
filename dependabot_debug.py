@@ -312,12 +312,31 @@ def process_pr(pr, token, args, llm, developing_md, npm_scripts, conn):
 
         try:
             print("Running npm install and npm run build in worktree...")
-            subprocess.run(["npm", "install"], cwd=worktree_dir, capture_output=True, check=True)
-            subprocess.run(["npm", "run", "build"], cwd=worktree_dir, capture_output=True)
+            reproduced_early = False
+            reproduction_script = ""
+            reproduction_output = ""
+
+            install_res = subprocess.run(["npm", "install"], cwd=worktree_dir, capture_output=True, text=True)
+            if install_res.returncode != 0:
+                print("npm install failed! Using it as reproduction step.")
+                reproduced_early = True
+                reproduction_script = "npm install"
+                reproduction_output = f"{install_res.stdout}\n{install_res.stderr}"
+            else:
+                build_res = subprocess.run(["npm", "run", "build"], cwd=worktree_dir, capture_output=True, text=True)
+                if build_res.returncode != 0:
+                    print("npm run build failed! Using it as reproduction step.")
+                    reproduced_early = True
+                    reproduction_script = "npm run build"
+                    reproduction_output = f"{build_res.stdout}\n{build_res.stderr}"
 
             if status == "summarized":
                 summary = state['summary']
-                reproduced, reproduction_output, reproduction_script = attempt_reproduction(llm, summary, developing_md, worktree_dir, npm_scripts)
+                
+                if reproduced_early:
+                    reproduced = True
+                else:
+                    reproduced, reproduction_output, reproduction_script = attempt_reproduction(llm, summary, developing_md, worktree_dir, npm_scripts)
                 
                 if not reproduced:
                     print("Could not reproduce the issue locally after 3 attempts.")
